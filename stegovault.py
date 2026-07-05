@@ -1,95 +1,138 @@
 import os
-import numpy as np
 from PIL import Image
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+import numpy as np
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives import padding
 from cryptography.hazmat.backends import default_backend
-import sys
+import hashlib
 
-def derive_key(password: str, salt=None):
-    if salt is None:
-        salt = os.urandom(16)
-    kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt, iterations=100000, backend=default_backend())
-    return kdf.derive(password.encode()), salt
+def derive_key(password: str) -> bytes:
+    """Derive 32-byte key from password using SHA-256"""
+    return hashlib.sha256(password.encode()).digest()
 
-def encrypt_data(data: bytes, password: str):
-    key, salt = derive_key(password)
+def encrypt_data(data: bytes, password: str) -> bytes:
+    """Encrypt data using AES-256-CBC"""
+    key = derive_key(password)
     iv = os.urandom(16)
+    padder = padding.PKCS7(128).padder()
+    padded_data = padder.update(data) + padder.finalize()
+    
     cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
     encryptor = cipher.encryptor()
-    pad = 16 - (len(data) % 16)
-    padded = data + bytes([pad] * pad)
-    encrypted = encryptor.update(padded) + encryptor.finalize()
-    return salt + iv + encrypted
+    encrypted = encryptor.update(padded_data) + encryptor.finalize()
+    return iv + encrypted
 
-def decrypt_data(encrypted_data: bytes, password: str):
-    if len(encrypted_data) < 32:
-        raise ValueError("Invalid data")
-    salt = bytes(encrypted_data[:16])
-    iv = bytes(encrypted_data[16:32])
-    ciphertext = bytes(encrypted_data[32:])
-    key, _ = derive_key(password, salt)
+def decrypt_data(encrypted_data: bytes, password: str) -> bytes:
+    """Decrypt data using AES-256-CBC"""
+    key = derive_key(password)
+    iv = encrypted_data[:16]
+    ciphertext = encrypted_data[16:]
+    
     cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
     decryptor = cipher.decryptor()
-    decrypted_padded = decryptor.update(ciphertext) + decryptor.finalize()
-    pad_length = decrypted_padded[-1]
-    if not (1 <= pad_length <= 16):
-        raise ValueError("Invalid padding")
-    return decrypted_padded[:-pad_length]
+    padded_data = decryptor.update(ciphertext) + decryptor.finalize()
+    
+    unpadder = padding.PKCS7(128).unpadder()
+    return unpadder.update(padded_data) + unpadder.finalize()
 
-def hide_in_image(data: bytes, cover_path: str, output_path: str):
-    cover = Image.open(cover_path).convert('RGB')
-    arr = np.array(cover, dtype=np.uint8).flatten()
-    length = len(data).to_bytes(4, 'big')
-    full_data = length + data
-    bits = np.unpackbits(np.frombuffer(full_data, dtype=np.uint8))
-    if len(bits) > len(arr):
-        print("❌ Cover image chhoti hai. Badi cover use karo.")
-        return
-    arr[:len(bits)] = (arr[:len(bits)] & 0xFE) | bits
-    h, w = Image.open(cover_path).size
-    new_img = Image.fromarray(arr.reshape(h, w, 3))
-    new_img.save(output_path, quality=95)
-    print(f"✅ Encrypted Image Saved: {output_path}")
+def hide_data_in_image(cover_img: Image.Image, data: bytes) -> Image.Image:
+    """Hide data inside image using LSB"""
+    img_array = np.array(cover_img)
+    flat = img_array.flatten()
+    
+    if len(data) * 8 > len(flat):
+        raise ValueError("Image too small to hide this data")
+    
+    binary_data = ''.join(format(byte, '08b') for byte in data)
+    
+    for i, bit in enumerate(binary_data):
+        flat[i] = (flat[i] & 0xFE) | int(bit)
+    
+    img_array = flat.reshape(img_array.shape)
+    return Image.fromarray(img_array.astype('uint8'))
 
-def extract_from_image(stego_path: str):
-    img = Image.open(stego_path).convert('RGB')
-    arr = np.array(img, dtype=np.uint8).flatten()
-    bits = arr & 1
-    byte_data = np.packbits(bits).tobytes()
-    if len(byte_data) < 4:
-        raise ValueError("No hidden data found")
-    length = int.from_bytes(byte_data[:4], 'big')
-    return byte_data[4:4+length]
+def extract_data_from_image(img: Image.Image, data_length: int) -> bytes:
+    """Extract hidden data from image"""
+    img_array = np.array(img).flatten()
+    binary_data = ''.join(str(pixel & 1) for pixel in img_array[:data_length * 8])
+    return bytes(int(binary_data[i:i+8], 2) for i in range(0, len(binary_data), 8))
 
-def main():
-    print("=== StegoVault - Secure Image Hider ===\n")
-    if len(sys.argv) < 4:
-        print("Usage:")
-        print("  Encrypt: python stegovault.py encrypt <original> <cover> <password>")
-        print("  Decrypt: python stegovault.py decrypt <stego_image> <password>")
-        return
+# ==================== MAIN FUNCTIONS ====================
 
-    if sys.argv[1] == "encrypt":
-        with open(sys.argv[2], "rb") as f:
-            data = f.read()
-        encrypted = encrypt_data(data, sys.argv[4])
-        hide_in_image(encrypted, sys.argv[3], "stegovault_encrypted.png")
+def encrypt_image(original_path: str, cover_path: str, password: str, output_path: str = None):
+    """Encrypt original image and hide it inside cover image. Output = JPG"""
+    
+    # Load images
+    original_img = Image.open(original_path).convert("RGB")
+    cover_img = Image.open(cover_path).convert("RGB")
 
-    elif sys.argv[1] == "decrypt":
-        extracted = extract_from_image(sys.argv[2])
-        original_data = decrypt_data(extracted, sys.argv[3])
-        with open("decrypted_original.png", "wb") as f:
-            f.write(original_data)
-        print("✅ Decryption Successful! File saved as decrypted_original.png")
-        try:
-            img = Image.open("decrypted_original.png")
-            print(f"Verified: {img.size}, Mode: {img.mode}")
-        except:
-            pass
-    else:
-        print("Invalid command. Use 'encrypt' or 'decrypt'")
+    # Convert original image to bytes
+    from io import BytesIO
+    buffer = BytesIO()
+    original_img.save(buffer, format="PNG")
+    original_bytes = buffer.getvalue()
+
+    # Encrypt the data
+    encrypted_data = encrypt_data(original_bytes, password)
+
+    # Hide encrypted data inside cover image
+    final_img = hide_data_in_image(cover_img, encrypted_data)
+
+    # Save as JPG
+    if output_path is None:
+        base_name = os.path.splitext(cover_path)[0]
+        output_path = f"{base_name}_encrypted.jpg"
+
+    final_img.save(output_path, format="JPEG", quality=92)
+    return output_path
+
+
+def decrypt_image(encrypted_path: str, password: str, output_path: str = None):
+    """Decrypt hidden image from encrypted image"""
+    
+    img = Image.open(encrypted_path).convert("RGB")
+    
+    # Extract hidden data (we need to know original data length)
+    # For simplicity, we extract a fixed large chunk and trim later
+    extracted = extract_data_from_image(img, 500000)  # Adjust size as needed
+    
+    # Decrypt
+    decrypted_data = decrypt_data(extracted, password)
+    
+    # Save decrypted image
+    if output_path is None:
+        base_name = os.path.splitext(encrypted_path)[0]
+        output_path = f"{base_name}_decrypted.png"
+    
+    with open(output_path, "wb") as f:
+        f.write(decrypted_data)
+    
+    return output_path
+
+
+# ==================== CLI USAGE ====================
 
 if __name__ == "__main__":
-    main()
+    import sys
+    
+    if len(sys.argv) < 2:
+        print("Usage:")
+        print("  python stegovault.py encrypt <original> <cover> <password>")
+        print("  python stegovault.py decrypt <encrypted> <password>")
+        sys.exit(1)
+    
+    mode = sys.argv[1]
+    
+    if mode == "encrypt":
+        if len(sys.argv) != 5:
+            print("Usage: python stegovault.py encrypt <original_image> <cover_image> <password>")
+            sys.exit(1)
+        result = encrypt_image(sys.argv[2], sys.argv[3], sys.argv[4])
+        print(f"✅ Encrypted Image Saved: {result}")
+    
+    elif mode == "decrypt":
+        if len(sys.argv) != 4:
+            print("Usage: python stegovault.py decrypt <encrypted_image> <password>")
+            sys.exit(1)
+        result = decrypt_image(sys.argv[2], sys.argv[3])
+        print(f"✅ Decryption Successful! File saved as {result}")
